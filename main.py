@@ -165,51 +165,62 @@ class HybridTinyMambaLM(nn.Module):
         return states
 
 
-# ---- Training Example ----
-vocab_size = 30
-model = HybridTinyMambaLM(vocab_size=vocab_size, d_model=32, d_state=16, n_layers=4, base_decay=0.05)
-device = torch.device("cpu")
-model.to(device)
+def train():
+    # ---- Training Example ----
+    vocab_size = 30
+    model = HybridTinyMambaLM(vocab_size=vocab_size, d_model=32, d_state=16, n_layers=4, base_decay=0.05)
+    device = torch.device("cpu")
+    model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
-criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss()
 
-# Toy data (sequence modeling)
-inputs = torch.randint(0, vocab_size, (8, 10))
-targets = torch.randint(0, vocab_size, (8, 10))
+    # Toy data (sequence modeling)
+    inputs = torch.randint(0, vocab_size, (8, 10))
+    targets = torch.randint(0, vocab_size, (8, 10))
 
-prev_states = model.load_states("state", device=device)
+    prev_states = model.load_states("state", device=device)
 
-for epoch in range(3):
-    optimizer.zero_grad()
-    logits, prev_states = model(inputs, prev_states)
-    loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
-    loss.backward()
-    optimizer.step()
-    print(f"Epoch {epoch+1} | Loss: {loss.item():.4f}")
+    for epoch in range(3):
+        optimizer.zero_grad()
+        logits, prev_states = model(inputs, prev_states)
+        loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch+1} | Loss: {loss.item():.4f}")
 
-model.save_states(prev_states)
-print("Training done, states persisted.")
+    model.save_states(prev_states)
+    print("Training done, states persisted.")
 
-# Persistent Generation
-vocab_size = 10
-seq_len = 5
-model = HybridTinyMambaLM(vocab_size=vocab_size, d_model=16, d_state=8, n_layers=3)
-device = torch.device("cpu")
 
-# Load states from previous session (if any)
-prev_states = model.load_states(path="state", device=device)
-input_ids = torch.tensor([[1, 2, 3]])
+def generate():
+    # Persistent Generation
+    vocab_size = 10
+    seq_len = 5
+    model = HybridTinyMambaLM(vocab_size=vocab_size, d_model=16, d_state=8, n_layers=3)
+    device = torch.device("cpu")
 
-generated = []
-for t in range(seq_len):
-    logits, prev_states = model(input_ids, prev_states, seq_start_idx=t)
-    next_token = torch.argmax(logits[:, -1, :], dim=-1)
-    generated.append(next_token.item())
-    input_ids = next_token.unsqueeze(0)
+    # Load states from previous session (if any)
+    prev_states = model.load_states(path="state", device=device)
+    input_ids = torch.tensor([[1, 2, 3]])
 
-# Save updated states for future sessions
-model.save_states(prev_states, path="state")
+    generated = []
+    for t in range(seq_len):
+        logits, prev_states = model(input_ids, prev_states, seq_start_idx=t)
+        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+        generated.append(next_token.item())
+        input_ids = next_token.unsqueeze(0)
 
-print("Generated sequence:", generated)
-print("States saved to ./state/")
+    # Save updated states for future sessions
+    model.save_states(prev_states, path="state")
+
+    print("Generated sequence:", generated)
+    print("States saved to ./state/")
+
+
+def main():
+    print("Tiny Mamba!")
+
+
+if __name__ == "__main__":
+    main()
