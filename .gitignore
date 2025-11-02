@@ -9,3 +9,6 @@ wheels/
 # environments
 .venv
 .env
+
+# state files
+state/

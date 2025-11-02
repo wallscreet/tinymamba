@@ -32,7 +32,7 @@ class RoPE(nn.Module):
 
 
 class TinyMambaLayer(nn.Module):
-    def __init__(self, d_model=16, d_state=8):
+    def __init__(self, d_model=16, d_state=8, decay_rate=0.05):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -78,49 +78,28 @@ class GatedTinyMambaLayer(nn.Module):
         )
 
     def forward(self, x, prev_state=None):
-        """
-        x: (B, T, d_model)
-        prev_state: (B, d_state) or None
-        """
         B, T, _ = x.shape
-
-        # Input contribution: Δ_t = in_proj(x)
         delta = self.in_proj(x)  # (B, T, d_state)
 
         if prev_state is not None:
-            # Expand previous state to sequence length
-            s_prev = prev_state.unsqueeze(1)                 # (B, 1, d_state)
-            s_prev = s_prev.expand(-1, T, -1)                # (B, T, d_state)
+            s_prev = prev_state.unsqueeze(1).expand(-1, T, -1)  # (B, T, d_state)
+            s_trans = self.s_proj(s_prev)                      # (B, T, d_state)
 
-            # State transition: B * prev_state
-            s_trans = self.s_proj(s_prev)                    # (B, T, d_state)
-
-            # Context-aware decay: base_decay * sigmoid(ctrl)
-            # decay is intended to simulate temporal memory decay in humans (maybe?)
-            ctx = torch.cat([x, s_prev], dim=-1)              # (B, T, d_model + d_state)
-            decay_factor = self.decay_ctrl(ctx)               # (B, T, d_state) ∈ [0,1]
+            ctx = torch.cat([x, s_prev], dim=-1)
+            decay_factor = self.decay_ctrl(ctx)
             decay = torch.exp(-self.base_decay * decay_factor)
-            s_decayed = s_prev * decay                        # (B, T, d_state)
+            s_decayed = s_prev * decay
 
-            # Combine: h_t = Δ_t + B * decayed_prev
             h = delta + s_trans * s_decayed
 
-            # Gating: selective parameter style
-            gate_in = torch.sigmoid(self.gate_x(x))           # (B, T, d_state)
-            gate_state = torch.sigmoid(self.gate_s(s_prev))   # (B, T, d_state)
-            gate = gate_in * gate_state                       # Elementwise selectivity
-            h = h * gate
-
-        else:
-            # No prev state: just gated input
-            h = delta
             gate_in = torch.sigmoid(self.gate_x(x))
-            h = h * gate_in
+            gate_state = torch.sigmoid(self.gate_s(s_prev))
+            h = h * gate_in * gate_state
+        else:
+            h = delta * torch.sigmoid(self.gate_x(x))
 
-        out = self.out_proj(h)                                # (B, T, d_model)
-        new_state = h[:, -1, :]                               # (B, d_state)
-
-        return out, new_state
+        out = self.out_proj(h)
+        return out, h[:, -1, :]
 
 
 class TinyAttentionLayer(nn.Module):
@@ -128,35 +107,43 @@ class TinyAttentionLayer(nn.Module):
         super().__init__()
         self.n_heads = n_heads
         self.d_head  = d_model // n_heads
-        self.attn    = nn.MultiheadAttention(embed_dim=d_model,
-                                             num_heads=n_heads,
-                                             batch_first=True)
         self.rope    = RoPE(self.d_head, max_seq=max_seq)
+
+        # Separate projections for Q, K, V
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # Use standard scaled dot-product attention for simplicity
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
 
     def forward(self, x, prev_state=None, seq_idx=0):
         B, L, D = x.shape
 
-        # reshape to (B, H, L, d_head)
-        qkv = x.reshape(B, L, self.n_heads, self.d_head) \
-               .permute(0, 2, 1, 3)                            # (B,H,L,d_h)
+        # Separate projections
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        # RoPE on Q and K (V stays untouched)
-        q = self.rope.apply(qkv, offset=seq_idx)
-        k = self.rope.apply(qkv, offset=seq_idx)
-        v = qkv
+        # Reshape to (B, H, L, d_head)
+        q = q.view(B, L, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        k = k.view(B, L, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        v = v.view(B, L, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
-        # back to (B, L, D) for MultiheadAttention
+        # Apply RoPE to Q and K only
+        q = self.rope.apply(q, offset=seq_idx)
+        k = self.rope.apply(k, offset=seq_idx)
+
+        # Back to (B, L, D)
         q = q.permute(0, 2, 1, 3).reshape(B, L, D)
         k = k.permute(0, 2, 1, 3).reshape(B, L, D)
         v = v.permute(0, 2, 1, 3).reshape(B, L, D)
 
-        # causal mask
-        mask = torch.triu(torch.ones(L, L, device=x.device) * float('-inf'),
-                          diagonal=1).bool()
+        # Build causal mask
+        mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
 
-        attn_out, _ = self.attn(q, k, v,
-                                attn_mask=mask,
-                                need_weights=False)
+        # MultiheadAttention expects (B, L, D)
+        attn_out, _ = self.attn(q, k, v, attn_mask=mask, need_weights=False)
         return attn_out, None
 
 
@@ -178,9 +165,13 @@ class TinyBlock(nn.Module):
             raise ValueError(f"Unknown layer_type {layer_type}")
 
     def forward(self, x, prev_state=None, seq_idx=0):
-        x_norm = self.norm(x)                                   # pre-normalization
-        out, new_state = self.layer(x_norm, prev_state, seq_idx)
-        return x + out, new_state                               # residual
+        x_norm = self.norm(x)
+
+        if isinstance(self.layer, TinyAttentionLayer):
+            out, new_state = self.layer(x_norm, prev_state, seq_idx=seq_idx)
+        else:
+            out, new_state = self.layer(x_norm, prev_state)
+        return x + out, new_state
 
 
 # SSM-Transformer hybrid model
@@ -208,38 +199,28 @@ class HybridTinyMambaLM(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             if i == attn_layer_idx:
-                block = TinyBlock(d_model=d_model,
-                                  d_state=d_state,
-                                  base_decay=base_decay,
-                                  layer_type='attn',
-                                  n_heads=n_heads,
-                                  max_seq=max_seq)
+                block = TinyBlock(d_model=d_model, d_state=d_state, base_decay=base_decay, layer_type='attn', n_heads=n_heads, max_seq=max_seq)
             else:
-                block = TinyBlock(d_model=d_model,
-                                  d_state=d_state,
-                                  base_decay=base_decay,
-                                  layer_type='gated_ssm')
+                block = TinyBlock(d_model=d_model, d_state=d_state, base_decay=base_decay, layer_type='gated_ssm')
             self.layers.append(block)
 
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
 
-    def forward(self, input_ids, prev_states=None, seq_start_idx=0):
-        x = self.embedding(input_ids)                               # (B, T, d_model)
+    def forward(self, input_ids, prev_states=None, position_offset=0):
+        x = self.embedding(input_ids)
+        B, T = input_ids.shape
         if prev_states is None:
             prev_states = [None] * len(self.layers)
 
         new_states = []
-        pos = seq_start_idx
-        for layer, prev_state in zip(self.layers, prev_states):
-            # Attention layers need the *absolute* position offset
-            out, state = layer(x, prev_state, seq_idx=pos)
+        for i, (block, prev_state) in enumerate(zip(self.layers, prev_states)):
+            if i == self.attn_layer_idx:
+                out, state = block(x, prev_state, seq_idx=position_offset)
+            else:
+                out, state = block(x, prev_state)  # ← NO seq_idx
             x = out
             new_states.append(state)
-            # only advance position for the next token when we are in generation
-            # (training uses a full sequence, so we keep pos=0)
-            if input_ids.shape[1] == 1:                             # single-token step (generation)
-                pos += 1
         logits = self.lm_head(x)
         return logits, new_states
 
@@ -263,34 +244,53 @@ class HybridTinyMambaLM(nn.Module):
                 states.append(None)
         return states
 
-
+#=================== Train, Gen & REPL ===================#
 def train():
     vocab_size = 30
-    model = HybridTinyMambaLM(vocab_size=vocab_size,
-                              d_model=32,
-                              d_state=16,
-                              n_layers=4,
-                              attn_layer_idx=1,
-                              base_decay=0.05)
+    model = HybridTinyMambaLM(
+        vocab_size=vocab_size,
+        d_model=32,
+        d_state=16,
+        n_layers=4,
+        attn_layer_idx=1,
+        base_decay=0.05
+    )
     device = torch.device("cpu")
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     criterion = nn.CrossEntropyLoss()
 
+    # Random dummy data
     inputs  = torch.randint(0, vocab_size, (8, 10), device=device)
     targets = torch.randint(0, vocab_size, (8, 10), device=device)
 
+    # Load previous states if they exist
     prev_states = model.load_states("state", device=device)
 
-    for epoch in range(3):
+    for epoch in range(42):
         optimizer.zero_grad()
-        logits, prev_states = model(inputs, prev_states, seq_start_idx=0)
+
+        # Forward pass
+        logits, prev_states = model(inputs, prev_states, position_offset=0)
+
+        # Compute loss
         loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
+
+        # Backprop
         loss.backward()
         optimizer.step()
+
+        # Detach recurrent states from the computation graph
+        if prev_states is not None:
+            if isinstance(prev_states, (tuple, list)):
+                prev_states = tuple(s.detach() for s in prev_states if s is not None)
+            else:
+                prev_states = prev_states.detach()
+
         print(f"Epoch {epoch+1} | Loss: {loss.item():.4f}")
 
+    # Persist final states
     model.save_states(prev_states)
     print("Training done, states persisted.")
 
@@ -298,23 +298,25 @@ def train():
 def generate():
     vocab_size = 10
     seq_len    = 5
-    model = HybridTinyMambaLM(vocab_size=vocab_size,
-                              d_model=16,
-                              d_state=8,
-                              n_layers=3,
-                              attn_layer_idx=1,
-                              base_decay=0.05)
+    model = HybridTinyMambaLM(
+        vocab_size=vocab_size,
+        d_model=16,
+        d_state=8,
+        n_layers=3,
+        attn_layer_idx=1,
+        base_decay=0.05
+    )
     device = torch.device("cpu")
     model.to(device)
 
     prev_states = model.load_states(path="state", device=device)
-    input_ids   = torch.tensor([[1, 2, 3]], device=device)         # prompt
+    input_ids   = torch.tensor([[1, 2, 3]], device=device)
     generated   = input_ids[0].tolist()
-    pos         = input_ids.shape[1]                               # start after prompt
+    pos         = input_ids.shape[1]  # next position to generate
 
     for _ in range(seq_len):
-        logits, prev_states = model(input_ids, prev_states, seq_start_idx=pos)
-        next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)  # (1,1)
+        logits, prev_states = model(input_ids, prev_states, position_offset=pos)
+        next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         input_ids = torch.cat([input_ids, next_tok], dim=1)
         generated.append(next_tok.item())
         pos += 1
@@ -340,9 +342,23 @@ class TinyMambaREPL(cmd.Cmd):
         'Run generation: generate'
         generate()
 
+    def do_exit(self, arg):
+        'Exit the REPL: exit'
+        print("Goodbye! 👋")
+        return True
+    
     def do_quit(self, arg):
         'Quit the REPL: quit'
         return self.do_exit(arg)
+    
+    def do_reset(self, arg):
+        'Delete saved states'
+        import shutil
+        if os.path.exists("state"):
+            shutil.rmtree("state")
+            print("States reset.")
+        else:
+            print("No states to reset.")
 
     # empty line to allow to repeat last command
     def emptyline(self):
