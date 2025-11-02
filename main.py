@@ -31,26 +31,26 @@ class RoPE(nn.Module):
         return rotated
 
 
-class TinyMambaLayer(nn.Module):
-    def __init__(self, d_model=16, d_state=8, decay_rate=0.05):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.input_proj = nn.Linear(d_model, d_state)
-        self.state_proj = nn.Linear(d_state, d_state)
-        self.output_proj = nn.Linear(d_state, d_model)
-        self.gate = nn.Linear(d_model, d_state)
+# class TinyMambaLayer(nn.Module):
+#     def __init__(self, d_model=16, d_state=16, decay_rate=0.05):
+#         super().__init__()
+#         self.d_model = d_model
+#         self.d_state = d_state
+#         self.input_proj = nn.Linear(d_model, d_state)
+#         self.state_proj = nn.Linear(d_state, d_state)
+#         self.output_proj = nn.Linear(d_state, d_model)
+#         self.gate = nn.Linear(d_model, d_state)
 
-    def forward(self, x, prev_state=None):
-        B, T, D = x.shape
-        state = self.input_proj(x)
-        if prev_state is not None:
-            decayed_state = prev_state * math.exp(-self.decay_rate)
-            state = state + self.state_proj(decayed_state).unsqueeze(1)
-        g = torch.sigmoid(self.gate(x))
-        state = state * g
-        out = self.output_proj(state)
-        return out, state[:, -1, :]
+#     def forward(self, x, prev_state=None):
+#         B, T, D = x.shape
+#         state = self.input_proj(x)
+#         if prev_state is not None:
+#             decayed_state = prev_state * math.exp(-self.decay_rate)
+#             state = state + self.state_proj(decayed_state).unsqueeze(1)
+#         g = torch.sigmoid(self.gate(x))
+#         state = state * g
+#         out = self.output_proj(state)
+#         return out, state[:, -1, :]
 
 
 # Context gated state space layer
@@ -82,8 +82,16 @@ class GatedTinyMambaLayer(nn.Module):
         delta = self.in_proj(x)  # (B, T, d_state)
 
         if prev_state is not None:
-            s_prev = prev_state.unsqueeze(1).expand(-1, T, -1)  # (B, T, d_state)
-            s_trans = self.s_proj(s_prev)                      # (B, T, d_state)
+            #print(f"prev_state shape: {prev_state.shape}") # debug shape = [8, 16]
+            # s_prev = prev_state.unsqueeze(1).expand(-1, T, -1)
+            if prev_state.shape[0] == x.shape[0]:
+                assert prev_state.shape[-1] == self.d_state, (f"State dim mismatch: expected {self.d_state}, got {prev_state.shape[-1]}")
+                s_prev = prev_state.unsqueeze(1).expand(-1, T, -1)
+            else:
+                s_prev = torch.zeros(B, T, self.d_state, device=x.device)
+            #print(f"s_prev shape: {s_prev.shape}") # debug shape = [8, 3, 16]
+            #print(f"s_proj shape: {self.s_proj.weight.shape}") # debug shape = [8, 8]
+            s_trans = self.s_proj(s_prev)
 
             ctx = torch.cat([x, s_prev], dim=-1)
             decay_factor = self.decay_ctrl(ctx)
@@ -148,7 +156,7 @@ class TinyAttentionLayer(nn.Module):
 
 
 class TinyBlock(nn.Module):
-    def __init__(self, d_model, d_state=8, base_decay=0.05,
+    def __init__(self, d_model, d_state=16, base_decay=0.05,
                  layer_type='gated_ssm', n_heads=2, max_seq=512):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
@@ -179,7 +187,7 @@ class HybridTinyMambaLM(nn.Module):
     def __init__(self,
                  vocab_size=20,
                  d_model=16,
-                 d_state=8,
+                 d_state=16,
                  n_layers=3,
                  attn_layer_idx=1,
                  max_seq=512,
@@ -230,21 +238,44 @@ class HybridTinyMambaLM(nn.Module):
             if s is not None:
                 torch.save(s, os.path.join(path, f"layer_{i}.pt"))
 
+    # def load_states(self, path="state", device="cpu"):
+    #     states = []
+    #     for i in range(len(self.layers)):
+    #         fp = os.path.join(path, f"layer_{i}.pt")
+    #         if os.path.exists(fp):
+    #             s = torch.load(fp, map_location=device)
+    #             # decay only SSM layers
+    #             if s is not None and i != self.attn_layer_idx:
+    #                 s = s * math.exp(-self.base_decay)
+    #             states.append(s)
+    #         else:
+    #             states.append(None)
+    #     return states
     def load_states(self, path="state", device="cpu"):
+        os.makedirs(path, exist_ok=True)
         states = []
-        for i in range(len(self.layers)):
+
+        for i, layer in enumerate(self.layers):
             fp = os.path.join(path, f"layer_{i}.pt")
+            d_state = getattr(layer.layer, "d_state", self.d_state)  # default fallback
+
             if os.path.exists(fp):
                 s = torch.load(fp, map_location=device)
-                # decay only SSM layers
                 if s is not None and i != self.attn_layer_idx:
                     s = s * math.exp(-self.base_decay)
-                states.append(s)
+                if s is None:
+                    s = torch.zeros(1, d_state, device=device)
             else:
-                states.append(None)
+                s = torch.zeros(1, d_state, device=device)
+                print(f"[load_states] Missing layer_{i}.pt → initialized zeros ({d_state} dims)")
+
+            states.append(s)
+
         return states
 
-#=================== Train, Gen & REPL ===================#
+
+
+#=================== Train, Gen & REPL ===================
 def train():
     vocab_size = 30
     model = HybridTinyMambaLM(
@@ -262,9 +293,11 @@ def train():
     criterion = nn.CrossEntropyLoss()
 
     # Random dummy data
-    inputs  = torch.randint(0, vocab_size, (8, 10), device=device)
-    targets = torch.randint(0, vocab_size, (8, 10), device=device)
-
+    # inputs  = torch.randint(0, vocab_size, (8, 10), device=device)
+    # targets = torch.randint(0, vocab_size, (8, 10), device=device)
+    inputs  = torch.arange(0, 10).unsqueeze(0).repeat(8, 1) % vocab_size
+    targets = (inputs + 1) % vocab_size
+    
     # Load previous states if they exist
     prev_states = model.load_states("state", device=device)
 
@@ -294,14 +327,58 @@ def train():
     model.save_states(prev_states)
     print("Training done, states persisted.")
 
+def train_toy_pattern():
+    vocab_size = 10
+    seq_len = 6
+    batch_size = 8
+
+    model = HybridTinyMambaLM(
+        vocab_size=vocab_size,
+        d_model=32,
+        d_state=16,
+        n_layers=3,
+        attn_layer_idx=1,
+        base_decay=0.05
+    )
+    device = torch.device("cpu")
+    model.to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss()
+
+    # Simple modular increment pattern
+    # Inputs:  [0, 1, 2, 3, 4, 5, 6, 7]
+    # Targets: [1, 2, 3, 4, 5, 6, 7, 8]
+    #inputs = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1) % vocab_size
+    #targets = (inputs + 1) % vocab_size
+    inputs  = torch.tensor([list(range(seq_len)) for _ in range(batch_size)], device=device)
+    targets = torch.tensor([list(range(1, seq_len)) + [seq_len % vocab_size] for _ in range(batch_size)], device=device)
+
+    prev_states = model.load_states("state", device=device)
+
+    for epoch in range(420):
+        optimizer.zero_grad()
+        logits, prev_states = model(inputs, prev_states, position_offset=0)
+        loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
+        loss.backward()
+        optimizer.step()
+        
+        # Detach state to prevent graph reuse
+        prev_states = [s.detach() if s is not None else torch.zeros(1, model.d_state, device=device)for s in prev_states]
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1} | Loss: {loss.item():.4f}")
+
+    model.save_states(prev_states, path="state")
+    print("Toy pattern training complete. States saved.")
 
 def generate():
     vocab_size = 10
-    seq_len    = 5
+    seq_len    = 6
     model = HybridTinyMambaLM(
         vocab_size=vocab_size,
         d_model=16,
-        d_state=8,
+        d_state=16,
         n_layers=3,
         attn_layer_idx=1,
         base_decay=0.05
@@ -310,13 +387,15 @@ def generate():
     model.to(device)
 
     prev_states = model.load_states(path="state", device=device)
-    input_ids   = torch.tensor([[1, 2, 3]], device=device)
+    input_ids   = torch.tensor([[1, 2, 3, 4]], device=device)
     generated   = input_ids[0].tolist()
     pos         = input_ids.shape[1]  # next position to generate
 
     for _ in range(seq_len):
         logits, prev_states = model(input_ids, prev_states, position_offset=pos)
-        next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        probs = torch.softmax(logits[:, -1, :] / 1.0, dim=-1)  # temperature = 1.0
+        next_tok = torch.multinomial(probs, num_samples=1)
+        #next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         input_ids = torch.cat([input_ids, next_tok], dim=1)
         generated.append(next_tok.item())
         pos += 1
@@ -324,6 +403,36 @@ def generate():
     model.save_states(prev_states, path="state")
     print("Generated sequence:", generated)
     print("States saved to ./state/")
+
+def generate_pattern():
+    vocab_size = 10
+    model = HybridTinyMambaLM(
+        vocab_size=vocab_size,
+        d_model=32,
+        d_state=16,
+        n_layers=3,
+        attn_layer_idx=1,
+        base_decay=0.05
+    )
+    device = torch.device("cpu")
+    model.to(device)
+
+    prev_states = model.load_states(path="state", device=device)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
+    generated = input_ids[0].tolist()
+    pos = input_ids.shape[1]
+
+    for _ in range(10):  # generate 10 more tokens
+        logits, prev_states = model(input_ids, prev_states, position_offset=pos)
+        probs = torch.softmax(logits[:, -1, :] / 0.8, dim=-1)  # temperature < 1 = more confident
+        next_tok = torch.multinomial(probs, num_samples=1)
+        input_ids = torch.cat([input_ids, next_tok], dim=1)
+        generated.append(next_tok.item())
+        pos += 1
+
+    model.save_states(prev_states, path="state")
+    print("Generated sequence:", generated)
 
 
 class TinyMambaREPL(cmd.Cmd):
@@ -336,11 +445,13 @@ class TinyMambaREPL(cmd.Cmd):
 
     def do_train(self, arg):
         'Run the training loop: train'
-        train()
+        #train_()
+        train_toy_pattern()
 
     def do_generate(self, arg):
         'Run generation: generate'
-        generate()
+        #generate()
+        generate_pattern()
 
     def do_exit(self, arg):
         'Exit the REPL: exit'
