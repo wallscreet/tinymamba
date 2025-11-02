@@ -43,6 +43,12 @@ model.save_state("./state")
 model.load_state("./state")
 ```
 
+To run:
+
+```bash
+uv run tiny_mamba.py   # You should see 'Tiny Mamba!' and the REPL will start
+```
+
 ## Intended Purpose
 
 TinyMamba is not meant as a production model.
