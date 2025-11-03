@@ -9,20 +9,20 @@ import cmd
 # Config
 class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    vocab_size = 32
+    vocab_size = 24
     d_model = 32
     d_state = 16
-    n_layers = 4
-    n_heads = 2
+    n_layers = 10
+    n_heads = 4
     max_seq = 512
     attn_layer_idx = 2          # middle layer gets attention
     base_decay = 0.05
-    learning_rate = 1e-3
-    training_epochs = 420
+    learning_rate = 2e-3
+    training_epochs = 400
     eval_interval = 20
     batch_size = 1
     seq_len = 20
-    context_factor = .75
+    context_factor = .5
     state_path = "state"
 
 
@@ -150,7 +150,7 @@ class GatedTinyMambaLayer(nn.Module):
                 perturb_in = torch.cat([s_pred, s_prev], dim=-1)
 
             perturb_vec = torch.tanh(self.perturb_proj(perturb_in))
-            perturb_strength = torch.sigmoid(self.perturb_gate(s_prev))
+            perturb_strength = torch.sigmoid(self.perturb_gate(s_pred))
             s_corrected = s_pred + perturb_strength * perturb_vec
 
             gate_in = torch.sigmoid(self.gate_x(x))
