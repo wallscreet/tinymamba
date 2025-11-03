@@ -25,26 +25,6 @@ The model can save and reload its internal state between sessions, effectively a
 
 ## Usage
 
-```python
-from tiny_mamba import AdaptiveHybridTinyMambaLM
-
-model = AdaptiveHybridTinyMambaLM(
-    vocab_size=32000,
-    d_model=64,
-    d_state=32,
-    n_layers=4
-)
-
-# Forward pass
-output = model(input_ids)
-
-# Save and load memory state
-model.save_state("./state")
-model.load_state("./state")
-```
-
-To run:
-
 ```bash
 uv run tiny_mamba.py   # You should see 'Tiny Mamba!' and the REPL will start
 ```

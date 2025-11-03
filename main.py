@@ -1,13 +1,33 @@
-import os
+import os 
+import math 
 import torch
 import torch.nn as nn
-import math
-import matplotlib.pyplot as plt
+import torch.nn.functional as F
 import cmd
 
 
+# Config
+class Config:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    vocab_size = 32
+    d_model = 32
+    d_state = 16
+    n_layers = 4
+    n_heads = 2
+    max_seq = 512
+    attn_layer_idx = 2          # middle layer gets attention
+    base_decay = 0.05
+    learning_rate = 1e-3
+    training_epochs = 420
+    eval_interval = 20
+    batch_size = 1
+    seq_len = 20
+    context_factor = .75
+    state_path = "state"
+
+
 class RoPE(nn.Module):
-    def __init__(self, dim, max_seq=512):
+    def __init__(self, dim, max_seq=Config.max_seq):
         super().__init__()
         self.dim = dim
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
@@ -19,6 +39,7 @@ class RoPE(nn.Module):
     def apply(self, x, offset=0):
         # x: (B, H, L, d_head)
         B, H, L, dh = x.shape
+        offset = int(offset)
         cos = self.cos[offset:offset + L]               # (L, dim//2)
         sin = self.sin[offset:offset + L]
         cos = cos.unsqueeze(0).unsqueeze(0)             # (1,1,L,dim//2)
@@ -31,87 +52,8 @@ class RoPE(nn.Module):
         return rotated
 
 
-# class TinyMambaLayer(nn.Module):
-#     def __init__(self, d_model=16, d_state=16, decay_rate=0.05):
-#         super().__init__()
-#         self.d_model = d_model
-#         self.d_state = d_state
-#         self.input_proj = nn.Linear(d_model, d_state)
-#         self.state_proj = nn.Linear(d_state, d_state)
-#         self.output_proj = nn.Linear(d_state, d_model)
-#         self.gate = nn.Linear(d_model, d_state)
-
-#     def forward(self, x, prev_state=None):
-#         B, T, D = x.shape
-#         state = self.input_proj(x)
-#         if prev_state is not None:
-#             decayed_state = prev_state * math.exp(-self.decay_rate)
-#             state = state + self.state_proj(decayed_state).unsqueeze(1)
-#         g = torch.sigmoid(self.gate(x))
-#         state = state * g
-#         out = self.output_proj(state)
-#         return out, state[:, -1, :]
-
-
-# Context gated state space layer
-class GatedTinyMambaLayer(nn.Module):
-    def __init__(self, d_model=32, d_state=16, base_decay=0.05):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.base_decay = base_decay
-
-        # Projections
-        self.in_proj = nn.Linear(d_model, d_state, bias=False)
-        self.x_proj = nn.Linear(d_model, d_state, bias=False)   # Δ (input contribution)
-        self.s_proj = nn.Linear(d_state, d_state, bias=False)   # B (state transition)
-        self.out_proj = nn.Linear(d_state, d_model, bias=False)
-
-        # Selective gates (like Mamba's)
-        self.gate_x = nn.Linear(d_model, d_state)   # Input gate
-        self.gate_s = nn.Linear(d_state, d_state)   # State gate
-
-        # Adaptive decay: context → scalar per state dim
-        self.decay_ctrl = nn.Sequential(
-            nn.Linear(d_model + d_state, d_state),
-            nn.Sigmoid()  # 0 to 1 → multiply base_decay
-        )
-
-    def forward(self, x, prev_state=None):
-        B, T, _ = x.shape
-        delta = self.in_proj(x)  # (B, T, d_state)
-
-        if prev_state is not None:
-            #print(f"prev_state shape: {prev_state.shape}") # debug shape = [8, 16]
-            # s_prev = prev_state.unsqueeze(1).expand(-1, T, -1)
-            if prev_state.shape[0] == x.shape[0]:
-                assert prev_state.shape[-1] == self.d_state, (f"State dim mismatch: expected {self.d_state}, got {prev_state.shape[-1]}")
-                s_prev = prev_state.unsqueeze(1).expand(-1, T, -1)
-            else:
-                s_prev = torch.zeros(B, T, self.d_state, device=x.device)
-            #print(f"s_prev shape: {s_prev.shape}") # debug shape = [8, 3, 16]
-            #print(f"s_proj shape: {self.s_proj.weight.shape}") # debug shape = [8, 8]
-            s_trans = self.s_proj(s_prev)
-
-            ctx = torch.cat([x, s_prev], dim=-1)
-            decay_factor = self.decay_ctrl(ctx)
-            decay = torch.exp(-self.base_decay * decay_factor)
-            s_decayed = s_prev * decay
-
-            h = delta + s_trans * s_decayed
-
-            gate_in = torch.sigmoid(self.gate_x(x))
-            gate_state = torch.sigmoid(self.gate_s(s_prev))
-            h = h * gate_in * gate_state
-        else:
-            h = delta * torch.sigmoid(self.gate_x(x))
-
-        out = self.out_proj(h)
-        return out, h[:, -1, :]
-
-
 class TinyAttentionLayer(nn.Module):
-    def __init__(self, d_model=16, n_heads=2, max_seq=512):
+    def __init__(self, d_model=Config.d_model, n_heads=Config.n_heads, max_seq=Config.max_seq):
         super().__init__()
         self.n_heads = n_heads
         self.d_head  = d_model // n_heads
@@ -148,292 +90,220 @@ class TinyAttentionLayer(nn.Module):
         v = v.permute(0, 2, 1, 3).reshape(B, L, D)
 
         # Build causal mask
-        mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
-
+        mask = torch.triu(torch.ones(L, L, device=x.device) * float('-inf'), diagonal=1)
+        
         # MultiheadAttention expects (B, L, D)
-        attn_out, _ = self.attn(q, k, v, attn_mask=mask, need_weights=False)
+        attn_out, _ = self.attn(q, k, v, attn_mask=mask)
+        
         return attn_out, None
 
 
+class GatedTinyMambaLayer(nn.Module):
+    def __init__(self, d_model=Config.d_model, d_state=Config.d_state, base_decay=Config.base_decay):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.base_decay = base_decay
+
+        # Core projections
+        self.in_proj = nn.Linear(d_model, d_state, bias=False)   # Δ (input → state)
+        self.x_proj = nn.Linear(d_model, d_state, bias=False)    # additional input contribution
+        self.s_proj = nn.Linear(d_state, d_state, bias=False)    # state transition
+        self.out_proj = nn.Linear(d_state, d_model, bias=False)  # state → output
+
+        # Selective gates
+        self.gate_x = nn.Linear(d_model, d_state)
+        self.gate_s = nn.Linear(d_state, d_state)
+
+        # Adaptive decay
+        self.decay_ctrl = nn.Sequential(
+            nn.Linear(d_model + d_state, d_state),
+            nn.Sigmoid()
+        )
+
+        # Perturbation feedback
+        self.perturb_proj = nn.Linear(2 * d_state, d_state)  # learns direction of correction
+        self.perturb_gate = nn.Linear(d_state, d_state)      # controls perturbation strength
+
+    def forward(self, x, prev_state=None, goal=None):
+        B, T, _ = x.shape
+        delta = self.in_proj(x)
+
+        if prev_state is not None:
+            s_prev = (
+                prev_state.unsqueeze(1).expand(-1, T, -1)
+                if prev_state.shape[0] == B
+                else torch.zeros(B, T, self.d_state, device=x.device)
+            )
+
+            ctx = torch.cat([x, s_prev], dim=-1)
+            decay = torch.exp(-self.base_decay * self.decay_ctrl(ctx).clamp(0.0, 1.0))
+            s_decayed = s_prev * decay
+
+            s_pred = s_decayed + delta + self.x_proj(x) + 0.5 * self.s_proj(s_prev)
+
+            # Inject goal into perturbation logic
+            if goal is not None:
+                goal = goal.unsqueeze(1).expand(-1, T, -1)  # match temporal dims
+                perturb_in = torch.cat([s_pred, s_prev, goal], dim=-1)
+            else:
+                perturb_in = torch.cat([s_pred, s_prev], dim=-1)
+
+            perturb_vec = torch.tanh(self.perturb_proj(perturb_in))
+            perturb_strength = torch.sigmoid(self.perturb_gate(s_prev))
+            s_corrected = s_pred + perturb_strength * perturb_vec
+
+            gate_in = torch.sigmoid(self.gate_x(x))
+            gate_state = torch.sigmoid(self.gate_s(s_prev))
+            h = s_corrected * gate_in * gate_state
+
+        else:
+            h = delta * torch.sigmoid(self.gate_x(x))
+
+        out = self.out_proj(h)
+        return out, h[:, -1, :]
+
+
+# TinyBlock (with optional attention)
 class TinyBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, base_decay=0.05,
-                 layer_type='gated_ssm', n_heads=2, max_seq=512):
+    def __init__(self, d_model, d_state, base_decay, use_attention=False):
         super().__init__()
+        self.layer = (
+            TinyAttentionLayer(d_model=d_model, n_heads=Config.n_heads, max_seq=Config.max_seq) 
+            if use_attention else GatedTinyMambaLayer(d_model, d_state, base_decay))
         self.norm = nn.LayerNorm(d_model)
+        self.use_attention = use_attention
 
-        if layer_type == 'gated_ssm':
-            self.layer = GatedTinyMambaLayer(d_model=d_model,
-                                             d_state=d_state,
-                                             base_decay=base_decay)
-        elif layer_type == 'attn':
-            self.layer = TinyAttentionLayer(d_model=d_model,
-                                            n_heads=n_heads,
-                                            max_seq=max_seq)
-        else:
-            raise ValueError(f"Unknown layer_type {layer_type}")
-
-    def forward(self, x, prev_state=None, seq_idx=0):
+    def forward(self, x, state=None):
         x_norm = self.norm(x)
-
-        if isinstance(self.layer, TinyAttentionLayer):
-            out, new_state = self.layer(x_norm, prev_state, seq_idx=seq_idx)
+        if self.use_attention:
+            attn_out, _ = self.layer(x_norm)
+            return x + attn_out, state  # ← preserve state
         else:
-            out, new_state = self.layer(x_norm, prev_state)
-        return x + out, new_state
+            out, new_state = self.layer(x_norm, state)
+            return x + out, new_state
 
-
-# SSM-Transformer hybrid model
+# HybridTinyMambaLM
 class HybridTinyMambaLM(nn.Module):
-    def __init__(self,
-                 vocab_size=20,
-                 d_model=16,
-                 d_state=16,
-                 n_layers=3,
-                 attn_layer_idx=1,
-                 max_seq=512,
-                 base_decay=0.05,
-                 n_heads=2):
+    def __init__(self, config: Config):
         super().__init__()
-        self.d_model     = d_model
-        self.d_state     = d_state
-        self.base_decay  = base_decay
-        self.max_seq     = max_seq
-        self.n_heads     = n_heads
-        self.attn_layer_idx = attn_layer_idx
+        self.vocab_size = config.vocab_size
+        self.d_model = config.d_model
+        self.d_state = config.d_state
+        self.n_layers = config.n_layers
+        self.attn_layer_idx = config.attn_layer_idx
+        self.base_decay = config.base_decay
+        self.state_path = config.state_path
 
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.input_norm = nn.LayerNorm(config.d_model)
 
-        # build layers
-        self.layers = nn.ModuleList()
-        for i in range(n_layers):
-            if i == attn_layer_idx:
-                block = TinyBlock(d_model=d_model, d_state=d_state, base_decay=base_decay, layer_type='attn', n_heads=n_heads, max_seq=max_seq)
-            else:
-                block = TinyBlock(d_model=d_model, d_state=d_state, base_decay=base_decay, layer_type='gated_ssm')
-            self.layers.append(block)
+        self.layers = nn.ModuleList([
+            TinyBlock(config.d_model, config.d_state, config.base_decay,
+                      use_attention=(i == config.attn_layer_idx))
+            for i in range(config.n_layers)
+        ])
 
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        self.lm_head.weight = self.embedding.weight
+        self.output = nn.Linear(config.d_model, config.vocab_size)
 
-    def forward(self, input_ids, prev_states=None, position_offset=0):
-        x = self.embedding(input_ids)
-        B, T = input_ids.shape
-        if prev_states is None:
-            prev_states = [None] * len(self.layers)
-
-        new_states = []
-        for i, (block, prev_state) in enumerate(zip(self.layers, prev_states)):
-            if i == self.attn_layer_idx:
-                out, state = block(x, prev_state, seq_idx=position_offset)
-            else:
-                out, state = block(x, prev_state)  # ← NO seq_idx
-            x = out
-            new_states.append(state)
-        logits = self.lm_head(x)
-        return logits, new_states
-
-    def save_states(self, states, path="state"):
+    # State handling
+    def load_states(self, path=None, device="cpu", batch_size=1):
+        if path is None:
+            path = self.state_path
         os.makedirs(path, exist_ok=True)
-        for i, s in enumerate(states):
-            if s is not None:
-                torch.save(s, os.path.join(path, f"layer_{i}.pt"))
 
-    # def load_states(self, path="state", device="cpu"):
-    #     states = []
-    #     for i in range(len(self.layers)):
-    #         fp = os.path.join(path, f"layer_{i}.pt")
-    #         if os.path.exists(fp):
-    #             s = torch.load(fp, map_location=device)
-    #             # decay only SSM layers
-    #             if s is not None and i != self.attn_layer_idx:
-    #                 s = s * math.exp(-self.base_decay)
-    #             states.append(s)
-    #         else:
-    #             states.append(None)
-    #     return states
-    def load_states(self, path="state", device="cpu"):
-        os.makedirs(path, exist_ok=True)
         states = []
-
         for i, layer in enumerate(self.layers):
             fp = os.path.join(path, f"layer_{i}.pt")
-            d_state = getattr(layer.layer, "d_state", self.d_state)  # default fallback
+            d_state = getattr(layer.layer, "d_state", self.d_state)
 
             if os.path.exists(fp):
                 s = torch.load(fp, map_location=device)
-                if s is not None and i != self.attn_layer_idx:
+                if s is not None and not layer.use_attention:
                     s = s * math.exp(-self.base_decay)
-                if s is None:
-                    s = torch.zeros(1, d_state, device=device)
+
+                # Resize to correct batch size
+                if s.shape[0] > batch_size:
+                    s = s[:batch_size, :].clone()
+                elif s.shape[0] < batch_size:
+                    s = s.mean(dim=0, keepdim=True).expand(batch_size, -1).clone()
             else:
-                s = torch.zeros(1, d_state, device=device)
-                print(f"[load_states] Missing layer_{i}.pt → initialized zeros ({d_state} dims)")
+                s = torch.zeros(batch_size, d_state, device=device)
+                print(f"[load_states] Missing layer_{i}.pt → zeros ({d_state})")
 
-            states.append(s)
-
+            states.append(s.to(device))
         return states
 
+    def save_states(self, states, path=None):
+        if path is None:
+            path = self.state_path
+        os.makedirs(path, exist_ok=True)
+        for i, s in enumerate(states):
+            torch.save(s, os.path.join(path, f"layer_{i}.pt"))
+
+    # Forward
+    def forward(self, input_ids, prev_states=None, position_offset=0):
+        x = self.input_norm(self.embedding(input_ids))  # (B, T, D)
+        new_states = []
+
+        for i, block in enumerate(self.layers):
+            prev_state = None if prev_states is None else prev_states[i]
+            x, new_state = block(x, prev_state)
+            new_states.append(new_state)
+
+        logits = self.output(x)
+        return logits, new_states
 
 
-#=================== Train, Gen & REPL ===================
+# Training utilities
+def generate(model, prompt, steps=Config.seq_len):
+    model.eval()
+    input_ids = torch.tensor([prompt], device=Config.device)
+    states = model.load_states(Config.state_path, device=Config.device, batch_size=Config.batch_size)
+
+    with torch.no_grad():
+        for _ in range(steps):
+            logits, states = model(input_ids, states)
+            next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+
+    print("Generated sequence:", input_ids.squeeze().tolist())
+    return input_ids.squeeze().tolist()
+
+
 def train():
-    vocab_size = 30
-    model = HybridTinyMambaLM(
-        vocab_size=vocab_size,
-        d_model=32,
-        d_state=16,
-        n_layers=4,
-        attn_layer_idx=1,
-        base_decay=0.05
-    )
-    device = torch.device("cpu")
-    model.to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    print("Using device:", Config.device)
+    model = HybridTinyMambaLM(Config).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate)
     criterion = nn.CrossEntropyLoss()
 
-    # Random dummy data
-    # inputs  = torch.randint(0, vocab_size, (8, 10), device=device)
-    # targets = torch.randint(0, vocab_size, (8, 10), device=device)
-    inputs  = torch.arange(0, 10).unsqueeze(0).repeat(8, 1) % vocab_size
-    targets = (inputs + 1) % vocab_size
+    # Simple +1 pattern data
+    # inputs = torch.randint(0, cfg.vocab_size - 1, (cfg.batch_size, cfg.seq_len), device=cfg.device)
+    # targets = (inputs + 1) % cfg.vocab_size
+    seq = torch.arange(Config.seq_len, device=Config.device) % Config.vocab_size
+    inputs = seq.unsqueeze(0).repeat(Config.batch_size, 1)
+    targets = torch.roll(inputs, -1, dims=1)
+
+    prev_states = model.load_states(Config.state_path, device=Config.device, batch_size=Config.batch_size)
+
+    for epoch in range(Config.training_epochs):
+        optimizer.zero_grad()
+        logits, new_states = model(inputs, prev_states)
+        loss = criterion(logits.view(-1, Config.vocab_size), targets.view(-1))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        # Detach for next epoch
+        prev_states = [s.detach().clone() if s is not None else None for s in new_states]
+        
+        if (epoch + 1) % Config.eval_interval == 0:
+            print(f"Epoch {epoch+1}/{Config.training_epochs} | Loss: {loss.item():.4f}")
+            model.save_states(prev_states)
+            generate(model, [0, 1, 2, 3, 4, 5, 6], steps=Config.seq_len)
     
-    # Load previous states if they exist
-    prev_states = model.load_states("state", device=device)
-
-    for epoch in range(42):
-        optimizer.zero_grad()
-
-        # Forward pass
-        logits, prev_states = model(inputs, prev_states, position_offset=0)
-
-        # Compute loss
-        loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
-
-        # Backprop
-        loss.backward()
-        optimizer.step()
-
-        # Detach recurrent states from the computation graph
-        if prev_states is not None:
-            if isinstance(prev_states, (tuple, list)):
-                prev_states = tuple(s.detach() for s in prev_states if s is not None)
-            else:
-                prev_states = prev_states.detach()
-
-        print(f"Epoch {epoch+1} | Loss: {loss.item():.4f}")
-
-    # Persist final states
-    model.save_states(prev_states)
-    print("Training done, states persisted.")
-
-def train_toy_pattern():
-    vocab_size = 10
-    seq_len = 6
-    batch_size = 8
-
-    model = HybridTinyMambaLM(
-        vocab_size=vocab_size,
-        d_model=32,
-        d_state=16,
-        n_layers=3,
-        attn_layer_idx=1,
-        base_decay=0.05
-    )
-    device = torch.device("cpu")
-    model.to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
-    criterion = nn.CrossEntropyLoss()
-
-    # Simple modular increment pattern
-    # Inputs:  [0, 1, 2, 3, 4, 5, 6, 7]
-    # Targets: [1, 2, 3, 4, 5, 6, 7, 8]
-    #inputs = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1) % vocab_size
-    #targets = (inputs + 1) % vocab_size
-    inputs  = torch.tensor([list(range(seq_len)) for _ in range(batch_size)], device=device)
-    targets = torch.tensor([list(range(1, seq_len)) + [seq_len % vocab_size] for _ in range(batch_size)], device=device)
-
-    prev_states = model.load_states("state", device=device)
-
-    for epoch in range(420):
-        optimizer.zero_grad()
-        logits, prev_states = model(inputs, prev_states, position_offset=0)
-        loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
-        loss.backward()
-        optimizer.step()
-        
-        # Detach state to prevent graph reuse
-        prev_states = [s.detach() if s is not None else torch.zeros(1, model.d_state, device=device)for s in prev_states]
-        
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1} | Loss: {loss.item():.4f}")
-
-    model.save_states(prev_states, path="state")
-    print("Toy pattern training complete. States saved.")
-
-def generate():
-    vocab_size = 10
-    seq_len    = 6
-    model = HybridTinyMambaLM(
-        vocab_size=vocab_size,
-        d_model=16,
-        d_state=16,
-        n_layers=3,
-        attn_layer_idx=1,
-        base_decay=0.05
-    )
-    device = torch.device("cpu")
-    model.to(device)
-
-    prev_states = model.load_states(path="state", device=device)
-    input_ids   = torch.tensor([[1, 2, 3, 4]], device=device)
-    generated   = input_ids[0].tolist()
-    pos         = input_ids.shape[1]  # next position to generate
-
-    for _ in range(seq_len):
-        logits, prev_states = model(input_ids, prev_states, position_offset=pos)
-        probs = torch.softmax(logits[:, -1, :] / 1.0, dim=-1)  # temperature = 1.0
-        next_tok = torch.multinomial(probs, num_samples=1)
-        #next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-        input_ids = torch.cat([input_ids, next_tok], dim=1)
-        generated.append(next_tok.item())
-        pos += 1
-
-    model.save_states(prev_states, path="state")
-    print("Generated sequence:", generated)
-    print("States saved to ./state/")
-
-def generate_pattern():
-    vocab_size = 10
-    model = HybridTinyMambaLM(
-        vocab_size=vocab_size,
-        d_model=32,
-        d_state=16,
-        n_layers=3,
-        attn_layer_idx=1,
-        base_decay=0.05
-    )
-    device = torch.device("cpu")
-    model.to(device)
-
-    prev_states = model.load_states(path="state", device=device)
-
-    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
-    generated = input_ids[0].tolist()
-    pos = input_ids.shape[1]
-
-    for _ in range(10):  # generate 10 more tokens
-        logits, prev_states = model(input_ids, prev_states, position_offset=pos)
-        probs = torch.softmax(logits[:, -1, :] / 0.8, dim=-1)  # temperature < 1 = more confident
-        next_tok = torch.multinomial(probs, num_samples=1)
-        input_ids = torch.cat([input_ids, next_tok], dim=1)
-        generated.append(next_tok.item())
-        pos += 1
-
-    model.save_states(prev_states, path="state")
-    print("Generated sequence:", generated)
-
+    return model
+    
 
 class TinyMambaREPL(cmd.Cmd):
     intro = '\n🚀 Tiny Mamba! Type help or ? to list commands.\n'
@@ -445,13 +315,11 @@ class TinyMambaREPL(cmd.Cmd):
 
     def do_train(self, arg):
         'Run the training loop: train'
-        #train_()
-        train_toy_pattern()
+        train()
 
     def do_generate(self, arg):
         'Run generation: generate'
-        #generate()
-        generate_pattern()
+        generate(self.model_class(Config()).to(Config.device), [0, 1, 2, 3, 4], steps=10)
 
     def do_exit(self, arg):
         'Exit the REPL: exit'
@@ -465,8 +333,8 @@ class TinyMambaREPL(cmd.Cmd):
     def do_reset(self, arg):
         'Delete saved states'
         import shutil
-        if os.path.exists("state"):
-            shutil.rmtree("state")
+        if os.path.exists(Config.state_path):
+            shutil.rmtree(Config.state_path)
             print("States reset.")
         else:
             print("No states to reset.")
